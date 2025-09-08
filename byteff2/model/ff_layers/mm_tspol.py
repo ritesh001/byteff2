@@ -813,7 +813,7 @@ class Exp6Pol(FFLayer):
                                                                    ff_parameters['Exp6Pol.mu_p'],
                                                                    ff_parameters['Exp6Pol.ind_scaler'],
                                                                    ff_parameters['Exp6Pol.ind_lambda3'],
-                                                                   ff_parameters['Exp6Pol.ind_lambda3'],
+                                                                   ff_parameters['Exp6Pol.ind_lambda5'],
                                                                    exlude_charge=True,
                                                                    cluster=False)
 
