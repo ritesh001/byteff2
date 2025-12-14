@@ -66,7 +66,8 @@ rm -rf "${TOP_LEVEL_DIR}/build" && \
   cd "${TOP_LEVEL_DIR}/build"
 
 ## Installs dependencies to compile libs
-apt update && apt install -y cmake swig doxygen python3-venv
+# apt is not found on this system. Please install cmake, swig, doxygen, and python3-venv manually.
+# For macOS, you can use: brew install cmake swig doxygen python3
 
 ###########################################
 ### CPU & CUDA libs and Python wrappers ###
@@ -77,22 +78,22 @@ cmake -DBUILD_TESTING=OFF \
       -DCMAKE_CXX_FLAGS:STRING=-D_GLIBCXX_USE_CXX11_ABI=${GLIBCXX_ABI} \
       -DCMAKE_CXX_FLAGS_RELEASE:STRING="-O2 -DNDEBUG" \
       -DCMAKE_C_FLAGS_RELEASE:STRING="-O2 -DNDEBUG" \
-      -DOPENMM_BUILD_AMOEBA_CUDA_LIB=ON \
-      -DOPENMM_BUILD_AMOEBA_OPENCL_LIB=OFF \
+      -DOPENMM_BUILD_AMOEBA_CUDA_LIB=OFF \
+      -DOPENMM_BUILD_AMOEBA_OPENCL_LIB=ON \
       -DOPENMM_BUILD_AMOEBA_PLUGIN=ON \
       -DOPENMM_BUILD_COMMON=OFF \
       -DOPENMM_BUILD_CPU_LIB=ON \
-      -DOPENMM_BUILD_CUDA_LIB=ON \
+      -DOPENMM_BUILD_CUDA_LIB=OFF \
       -DOPENMM_BUILD_CUDA_TESTS=OFF \
-      -DOPENMM_BUILD_DRUDE_CUDA_LIB=ON \
-      -DOPENMM_BUILD_DRUDE_OPENCL_LIB=OFF \
+      -DOPENMM_BUILD_DRUDE_CUDA_LIB=OFF \
+      -DOPENMM_BUILD_DRUDE_OPENCL_LIB=ON \
       -DOPENMM_BUILD_DRUDE_PLUGIN=ON \
       -DOPENMM_BUILD_EXAMPLES=ON \
-      -DOPENMM_BUILD_OPENCL_LIB=OFF \
+      -DOPENMM_BUILD_OPENCL_LIB=ON \
       -DOPENMM_BUILD_PME_PLUGIN=ON \
       -DOPENMM_BUILD_PYTHON_WRAPPERS=ON \
-      -DOPENMM_BUILD_RPMD_CUDA_LIB=ON \
-      -DOPENMM_BUILD_RPMD_OPENCL_LIB=OFF \
+      -DOPENMM_BUILD_RPMD_CUDA_LIB=OFF \
+      -DOPENMM_BUILD_RPMD_OPENCL_LIB=ON \
       -DOPENMM_BUILD_RPMD_PLUGIN=ON \
       -DOPENMM_BUILD_SHARED_LIB=ON \
       -DOPENMM_BUILD_STATIC_LIB=OFF \
@@ -100,9 +101,9 @@ cmake -DBUILD_TESTING=OFF \
       -DPYTHON_EXECUTABLE=$(which python3) ..
 
 ## Builds targets and fills ${PREFIX_DIR}
-echo "### Compiling CPU and CUDA libs ###"
-make -j$(nproc) install
-echo "### Finished compiling CPU and CUDA libs ###"
+echo "### Compiling CPU and OpenCL libs ###"
+make -j$(sysctl -n hw.ncpu) install
+echo "### Finished compiling CPU and OpenCL libs ###"
 
 echo "### Building Python distribution ###"
 ## Requires C++ libs
