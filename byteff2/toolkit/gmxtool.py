@@ -200,7 +200,8 @@ class GMXScript:
 
         add_flag = """#!/bin/bash
 
-set -xe
+set -euo pipefail
+set -x
 
 # Default values
 ratio=1.0
@@ -217,7 +218,18 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
     esac
-done"""
+done
+
+# Detect GROMACS command
+GMX=${GMX:-gmx_mpi}
+if ! command -v "$GMX" >/dev/null 2>&1; then
+  if command -v gmx >/dev/null 2>&1; then
+    GMX=gmx
+  else
+    echo "Neither gmx_mpi nor gmx found in PATH" >&2
+    exit 127
+  fi
+fi"""
 
         self.add(add_flag)
         self.used_gro = []
@@ -230,22 +242,26 @@ done"""
     def init_gro_box(self, init_gro: str, box: float):
         self.add(f"default_box_size={box}")
         self.add('box_size=$(awk "BEGIN {print $default_box_size*$ratio}")')
-        self.add(f"gmx editconf -f {init_gro} -o {self.output_gro} -box $box_size $box_size $box_size")
+        # self.add(f"gmx editconf -f {init_gro} -o {self.output_gro} -box $box_size $box_size $box_size")
+        self.add(f"\"$GMX\" editconf -f {init_gro} -o {self.output_gro} -box $box_size $box_size $box_size") ## the command usually that works on HPCs is 'gmx_mpi' instead of 'gmx'
         self.index += 1
 
     def scale(self, scale: float):
-        self.add(f"gmx editconf -f {self.input_gro} -o {self.output_gro} -scale {scale}")
+        # self.add(f"gmx editconf -f {self.input_gro} -o {self.output_gro} -scale {scale}")
+        self.add(f"\"$GMX\" editconf -f {self.input_gro} -o {self.output_gro} -scale {scale}")
         self.index += 1
 
-    def insert_molecules(self, gro: str, num: int, try_count: int = 15000):
+    def insert_molecules(self, gro: str, num: int, try_count: int = 60000):
         self.add(
-            f"gmx insert-molecules -f {self.input_gro} -ci {gro} -o {self.output_gro} -nmol {num} -try {try_count}")
+            # f"gmx insert-molecules -f {self.input_gro} -ci {gro} -o {self.output_gro} -nmol {num} -try {try_count}")
+            f"\"$GMX\" insert-molecules -f {self.input_gro} -ci {gro} -o {self.output_gro} -nmol {num} -try {try_count}")
         self.used_gro.append(gro)
         self.index += 1
 
     def genconf(self, init_gro: str, box: int):
         assert init_gro.endswith(".gro"), "gro file is required."
-        self.add(f"gmx genconf -f {init_gro} -o {self.output_gro} -nbox {box}")
+        # self.add(f"gmx genconf -f {init_gro} -o {self.output_gro} -nbox {box}")
+        self.add(f"\"$GMX\" genconf -f {init_gro} -o {self.output_gro} -nbox {box}")
         self.index += 1
 
     def finish(self):

@@ -100,6 +100,7 @@ After successful installation, you should see:
 ```
 Success: Installed OpenMM and openmm-velocityVerlet.
 ```
+**My note:** I was having a lot of issues with the installation of their custom `openmm-velocityVerlet` library across MacOS and linux on two different HPCs with different machine configurations and environments. While I finally got `openmm-velocityVerlet` to install using pip, it would throw a segmentation error with the installation. Please note that `openmm-velocityVerlet` is only used for non-equilibrium MD run for viscosity calculations, so if you are interested in getting viscosity of electrolytes, this installation can be skipped. I have made several changes in this codebase to improve functionality and make it as generic as possible.
 
 ### Trained Models
 The model and configuration file are available on HuggingFace [byteff2](https://huggingface.co/ByteDance-Seed/byteff2).

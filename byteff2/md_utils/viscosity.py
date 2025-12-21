@@ -40,10 +40,14 @@ class ViscosityReporter(object):
         The interval (in time steps) at which to write frames
     '''
 
-    def __init__(self, file, reportInterval):
+    def __init__(self, file, reportInterval, append: bool = False):
         self._reportInterval = reportInterval
-        self._out = open(file, 'w')
+        mode = 'a' if append else 'w'
+        self._out = open(file, mode)
         self._hasInitialized = False
+        # If appending and file already has content, skip header
+        if append and os.path.isfile(file) and os.path.getsize(file) > 0:
+            self._hasInitialized = True
 
     def describeNextReport(self, simulation):
         """Get information about the next report this object will generate.
@@ -104,6 +108,8 @@ def nonequ_run(
     temperature: float,
     work_dir: str,
     nonequ_steps: int,
+    resume: bool = False,
+    checkpoint_interval: int = 5000,
 ):
     top = copy.deepcopy(top)
     system = copy.deepcopy(system)
@@ -120,19 +126,23 @@ def nonequ_run(
     )
     integrator.setUseMiddleScheme(True)
     integrator.setCosAcceleration(0.02)  # in openmm standard unit nm/ps^2
-    vis_reporter = ViscosityReporter(os.path.join(work_dir, 'viscosity.csv'), 50)
+    append_logs = bool(resume and os.path.isfile(os.path.join(work_dir, 'nonequ.chk')))
+    vis_reporter = ViscosityReporter('viscosity.csv', 50, append=append_logs)
+    chk_reporter = app.CheckpointReporter('nonequ.chk', checkpoint_interval)
     return openmm_run(
         task_name='nonequ',
         top=top,
         system=system,
         positions=positions,
         integrator=integrator,
-        reporter=[vis_reporter],
+        reporter=[vis_reporter, chk_reporter],
         work_dir=work_dir,
         minimize=False,
         box_vec=box_vec,
         steps=nonequ_steps,
         temperature=temperature,
+        resume=resume,
+        checkpoint_path='nonequ.chk',
     )
 
 

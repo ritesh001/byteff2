@@ -242,4 +242,9 @@ debug.ipynb
 **.yaml
 **.dcd
 
-submodules/openmm/openmm
+## added by me
+submodules/openmm
+.DS_Store
+**/.DS_Store
+*/*/.DS_Store
+example/test-*

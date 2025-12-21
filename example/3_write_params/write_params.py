@@ -35,7 +35,7 @@ def main():
     parser.add_argument('--mol_name', type=str, default='AFGBL')
     parser.add_argument('--mapped_smiles',
                         type=str,
-                        default='[C:1]([H:7])([H:8])([H:9])[O:2][C:3]([H:10])([H:11])[C:4]([H:12])([H:13])[O:5][C:6]([H:14])([H:15])([H:16])')
+                        default='[O:1]=[C:2]1[O:3][C:4]([H:8])([H:9])[C:5]([H:10])([H:11])[C@@:6]1([F:7])[H:12]')
     parser.add_argument('--out_dir', type=str, default='./params_results')
     args = parser.parse_args()
     out_dir = args.out_dir

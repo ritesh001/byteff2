@@ -7,6 +7,7 @@ from enum import Enum
 import ase.io as aio
 import numpy as np
 import openmm.app as app
+import openmm.unit as ou
 import pandas as pd
 
 from byteff2.md_utils.md_run import dcd_read, npt_run, nvt_run, rescale_box, volume_calc
@@ -142,9 +143,41 @@ def generate_system_gro(components, working_dir, box):
 
 
 def write_gro(mol: Molecule, save_path: str):
-    atoms_gro = mol.conformers[0].to_ase_atoms()
-    atoms_gro.set_array('residuenames', np.array([mol.name] * mol.natoms))
-    aio.write(save_path, atoms_gro)
+    """Write a single-molecule GRO file in strict fixed-width format.
+
+    GROMACS requires GRO files to use fixed columns. Some generic writers
+    produce variable-width fields that recent GROMACS rejects. We write the
+    minimal compliant fields here: title, natoms, atom lines (no velocities),
+    and a placeholder box (replaced later by editconf).
+    """
+    # Obtain positions (Angstrom) and convert to nm
+    atoms = mol.conformers[0].to_ase_atoms()
+    pos_A = atoms.get_positions()  # Angstrom
+    pos_nm = pos_A / 10.0
+
+    natoms = mol.natoms
+    resname = (mol.name or 'MOL')[:5]
+
+    def gro_line(resnr, resnm, atomnm, atomnr, x, y, z):
+        # %5d%-5s%5s%5d%8.3f%8.3f%8.3f
+        return f"{resnr:5d}{resnm:<5s}{atomnm:>5s}{atomnr:5d}{x:8.3f}{y:8.3f}{z:8.3f}\n"
+
+    lines = []
+    lines.append(f"GRO file created by ByteFF2 for {mol.name}\n")
+    lines.append(f"{natoms:5d}\n")
+    for i, (x, y, z) in enumerate(pos_nm, start=1):
+        # atom name up to 5 chars: element+index (e.g., C1, O5)
+        try:
+            elem = atoms[i - 1].symbol
+        except Exception:
+            elem = 'A'
+        atomnm = f"{elem}{i}"[:5]
+        lines.append(gro_line(1, resname, atomnm, i, x, y, z))
+    # Minimal box; will be replaced by editconf later
+    lines.append("   1.00000   1.00000   1.00000\n")
+
+    with open(save_path, 'w') as f:
+        f.writelines(lines)
 
 
 class Protocol:
@@ -212,15 +245,45 @@ class Protocol:
             lines.append(" 100.00000 100.00000 100.00000\n")
             with open(f'{working_dir}/solvent_salt_gas.gro', 'w') as new_gro_f:
                 new_gro_f.writelines(lines)
-        input_mol_ratio = np.array(list(components_ratio.values()))
-        real_total_atoms, mix = search_mixture(input_mol_ratio, total_atoms, total_atoms + 1000, components)
+        # Decide if 'components_ratio' should be treated as exact molecule counts
+        cfg = getattr(self, 'config', {}) if hasattr(self, 'config') else {}
+        components_counts_from_cfg = None
+        use_counts = False
+        if isinstance(cfg, dict):
+            if 'components_counts' in cfg and isinstance(cfg['components_counts'], dict):
+                components_counts_from_cfg = cfg['components_counts']
+                use_counts = True
+            elif cfg.get('components_as_counts', False) or cfg.get('components_mode', '').lower() == 'counts':
+                use_counts = True
 
-        full_topparse.molecules = []
-        box_charge = 0
-        for idx, component in enumerate(components.values()):
-            component.molar_num = mix[idx]
-            full_topparse.molecules.append(RecordMolecule.from_text(f"{component.name} {component.molar_num}"))
-            box_charge += component.molar_num * component.net_charge
+        if use_counts:
+            # Use exact counts either from dedicated 'components_counts' or values in 'components_ratio'
+            counts_source = components_counts_from_cfg or components_ratio
+            full_topparse.molecules = []
+            box_charge = 0
+            for name, component in components.items():
+                count = int(counts_source[name])
+                component.molar_num = count
+                full_topparse.molecules.append(RecordMolecule.from_text(f"{component.name} {component.molar_num}"))
+                box_charge += component.molar_num * component.net_charge
+            # Keep 'natoms' consistent with chosen composition
+            nat = int(sum(len(c.atoms) * c.molar_num for c in components.values()))
+            try:
+                # update in-memory config for downstream use
+                self.config['natoms'] = nat
+            except Exception:  # safety for unexpected config types
+                pass
+            real_total_atoms = nat
+        else:
+            input_mol_ratio = np.array(list(components_ratio.values()))
+            real_total_atoms, mix = search_mixture(input_mol_ratio, total_atoms, total_atoms + 1000, components)
+
+            full_topparse.molecules = []
+            box_charge = 0
+            for idx, component in enumerate(components.values()):
+                component.molar_num = mix[idx]
+                full_topparse.molecules.append(RecordMolecule.from_text(f"{component.name} {component.molar_num}"))
+                box_charge += component.molar_num * component.net_charge
         assert int(box_charge) == 0, f"Box charge should be 0, but got {box_charge}"
 
         init_density = predict_density(components)
@@ -236,8 +299,18 @@ class Protocol:
             shutil.copy(f'{working_dir}/system.top', f'{self.params_dir}/system_gas.top')
             return components
 
-        box = init_box
-        for _ in range(5):
+        # Allow overriding initial box via config if provided
+        cfg = getattr(self, 'config', {}) if hasattr(self, 'config') else {}
+        if isinstance(cfg, dict):
+            if 'box_length' in cfg and cfg['box_length'] is not None:
+                box = float(cfg['box_length'])
+            elif 'box_scale' in cfg and cfg['box_scale'] is not None:
+                box = float(init_box) * float(cfg['box_scale'])
+            else:
+                box = init_box
+        else:
+            box = init_box
+        for _ in range(8):
             generate_system_gro(components, working_dir, box)
             command = f'cd {working_dir} && bash -x run_gmx.sh'
             try:
@@ -247,16 +320,18 @@ class Protocol:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=300,
-                    check=True,
+                    timeout=600,
                 )
             except subprocess.TimeoutExpired:
-                print("Script time out!")
+                logger.warning("run_gmx.sh timed out at box %.3f nm; expanding by 5%% and retrying", box)
                 box *= 1.05
                 continue
             if child.returncode != 0:
-                print("Script gmx failed")
-                raise subprocess.CalledProcessError(child.returncode, command)
+                # Likely packing failure; expand and retry rather than aborting immediately
+                logger.warning("run_gmx.sh failed (code %s) at box %.3f nm; expanding by 5%% and retrying. Last lines:\n%s",
+                               child.returncode, box, '\n'.join(child.stderr.splitlines()[-20:]))
+                box *= 1.05
+                continue
             gro_file = os.path.join(working_dir, "solvent_salt.gro")
             with open(gro_file, "r") as f:
                 gro_total_atoms = int(f.readlines()[1].strip().split()[0])
@@ -264,6 +339,9 @@ class Protocol:
                 box *= 1.05
             else:
                 break
+        else:
+            # If we exhausted retries
+            raise RuntimeError(f"Failed to pack system after retries. Last stderr:\n{child.stderr}")
         shutil.copy(f'{working_dir}/solvent_salt.gro', f'{self.params_dir}/solvent_salt.gro')
         shutil.copy(f'{working_dir}/system.top', f'{self.params_dir}/system.top')
         return components
@@ -300,13 +378,18 @@ class DensityProtocol(Protocol):
             unit_cell,
         )
 
+        npt_steps = int(self.config.get('npt_steps', 1500000))
+        resume = bool(self.config.get('resume', False))
+        checkpoint_interval = int(self.config.get('checkpoint_interval', 5000))
         npt_run(
             top=input_top,
             system=input_system,
             positions=input_positions,
             temperature=self.config['temperature'],
-            npt_steps=1500000,
+            npt_steps=npt_steps,
             work_dir=self.output_dir,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
         )
         logger.info('Finished running density protocol')
 
@@ -337,9 +420,29 @@ class TransportProtocol(Protocol):
 
     def run_protocol(self):
         logger.info('running transport protocol')
-        npt_steps = 4000000
-        nvt_steps = 10000000
-        nonequ_steps = 1000000
+        # Defaults (2 fs timestep). Allow override by steps or by time.
+        def steps_from_time(cfg, steps_key, default_steps, time_ns_key=None, time_ps_key=None, timestep_fs=2):
+            if isinstance(cfg, dict):
+                if time_ns_key and cfg.get(time_ns_key) is not None:
+                    return int(float(cfg[time_ns_key]) * 1e6 / float(timestep_fs))
+                if time_ps_key and cfg.get(time_ps_key) is not None:
+                    return int(float(cfg[time_ps_key]) * 1e3 / float(timestep_fs))
+                if cfg.get(steps_key) is not None:
+                    return int(cfg[steps_key])
+            return int(default_steps)
+
+        npt_steps = steps_from_time(self.config, 'npt_steps', 4000000, time_ns_key='npt_time_ns', time_ps_key='npt_time_ps')
+        nvt_steps = steps_from_time(self.config, 'nvt_steps', 10000000, time_ns_key='nvt_time_ns', time_ps_key='nvt_time_ps')
+        # nonequilibrium run uses 1 fs timestep (VVIntegrator)
+        nonequ_steps = steps_from_time(self.config, 'nonequ_steps', 1000000, time_ns_key='nonequ_time_ns', time_ps_key='nonequ_time_ps', timestep_fs=1)
+        # Optional OpenMM platform/precision overrides via config
+        if isinstance(self.config, dict):
+            plat = self.config.get('openmm_platform')
+            prec = self.config.get('openmm_precision')
+            if plat:
+                os.environ['BYTEFF2_OPENMM_PLATFORM'] = str(plat)
+            if prec:
+                os.environ['BYTEFF2_OPENMM_PRECISION'] = str(prec)
         nonbonded_params = self.generate_ff_params(self.config['smiles'])
         self.components = self.build_system(
             self.config['natoms'],
@@ -356,76 +459,166 @@ class TransportProtocol(Protocol):
             nonbonded_params,
             unit_cell,
         )
-        logger.info('npt run')
-        npt_positions, npt_box_vec = npt_run(
-            input_top,
-            input_system,
-            input_positions,
-            temperature=self.config['temperature'],
-            npt_steps=npt_steps,
-            work_dir=self.output_dir,
-        )
-        rescale_positions, rescale_box_vec = rescale_box(npt_positions, npt_box_vec, work_dir=self.output_dir)
-        logger.info('nvt run')
-        nvt_positions, nvt_box_vec = nvt_run(
-            input_top,
-            input_system,
-            rescale_positions,
-            rescale_box_vec,
-            temperature=self.config['temperature'],
-            work_dir=self.output_dir,
-            nvt_steps=nvt_steps,
-        )
-        logger.info('nonequ run')
-        nonequ_run(
-            input_top,
-            input_system,
-            nvt_positions,
-            nvt_box_vec,
-            temperature=self.config['temperature'],
-            work_dir=self.output_dir,
-            nonequ_steps=nonequ_steps,
-        )
+        resume = bool(self.config.get('resume', False))
+        checkpoint_interval = int(self.config.get('checkpoint_interval', 5000))
+        start_from = (self.config.get('start_from') or 'npt').lower() if isinstance(self.config, dict) else 'npt'
+        if start_from not in ('npt', 'nvt', 'nonequ'):
+            start_from = 'npt'
+        compute_viscosity = bool(self.config.get('compute_viscosity', True)) if isinstance(self.config, dict) else True
+
+        if start_from == 'npt':
+            logger.info('npt run')
+            npt_positions, npt_box_vec = npt_run(
+                input_top,
+                input_system,
+                input_positions,
+                temperature=self.config['temperature'],
+                npt_steps=npt_steps,
+                work_dir=self.output_dir,
+                resume=resume,
+                checkpoint_interval=checkpoint_interval,
+            )
+            rescale_positions, rescale_box_vec = rescale_box(npt_positions, npt_box_vec, work_dir=self.output_dir)
+            logger.info('nvt run')
+            nvt_positions, nvt_box_vec = nvt_run(
+                input_top,
+                input_system,
+                rescale_positions,
+                rescale_box_vec,
+                temperature=self.config['temperature'],
+                work_dir=self.output_dir,
+                nvt_steps=nvt_steps,
+                resume=resume,
+                checkpoint_interval=checkpoint_interval,
+            )
+        elif start_from == 'nvt':
+            logger.info('start_from=nvt: skipping NPT and starting/resuming NVT')
+            nvt_positions, nvt_box_vec = nvt_run(
+                input_top,
+                input_system,
+                input_positions,
+                unit_cell,
+                temperature=self.config['temperature'],
+                work_dir=self.output_dir,
+                nvt_steps=nvt_steps,
+                resume=resume,
+                checkpoint_interval=checkpoint_interval,
+            )
+        else:  # start_from == 'nonequ'
+            logger.info('start_from=nonequ: loading NVT outputs to seed nonequilibrium run')
+            # Allow explicit paths via config, else look in output_dir then CWD
+            cfg = self.config if isinstance(self.config, dict) else {}
+            nvt_dcd = cfg.get('nvt_dcd')
+            nvt_csv = cfg.get('nvt_state_csv')
+            # Build candidate search lists
+            dcd_candidates = []
+            if nvt_dcd:
+                dcd_candidates.append(nvt_dcd)
+            dcd_candidates.extend([os.path.join(self.output_dir, 'nvt.dcd'), 'nvt.dcd', 'NVT.dcd', 'nvt.DCD', 'NVT.DCD'])
+            csv_candidates = []
+            if nvt_csv:
+                csv_candidates.append(nvt_csv)
+            csv_candidates.extend([
+                os.path.join(self.output_dir, 'nvt_state.csv'),
+                os.path.join(self.output_dir, 'nvt_results.csv'),
+                'nvt_state.csv',
+                'nvt_results.csv',
+                'nvt.csv',
+            ])
+            # Resolve first existing path
+            nvt_dcd = next((p for p in dcd_candidates if p and os.path.isfile(p)), None)
+            nvt_csv = next((p for p in csv_candidates if p and os.path.isfile(p)), None)
+            assert nvt_dcd and nvt_csv, f'Missing NVT outputs to seed nonequ run. Checked DCD: {dcd_candidates}, CSV: {csv_candidates}'
+            nvt_positions_np = dcd_read(nvt_dcd)
+            assert len(nvt_positions_np) > 0, 'Empty nvt.dcd'
+            last = nvt_positions_np[-1]
+            from openmm import Vec3
+            nvt_positions = [Vec3(x, y, z) * ou.nanometers for x, y, z in last]
+            import pandas as pd
+            df = pd.read_csv(nvt_csv)
+            L = df['Box Volume (nm^3)'].iloc[-1]**(1 / 3)
+            nvt_box_vec = (Vec3(L, 0.0, 0.0) * ou.nanometers, Vec3(0.0, L, 0.0) * ou.nanometers,
+                           Vec3(0.0, 0.0, L) * ou.nanometers)
+
+        if compute_viscosity:
+            logger.info('nonequ run')
+            nonequ_run(
+                input_top,
+                input_system,
+                nvt_positions,
+                nvt_box_vec,
+                temperature=self.config['temperature'],
+                work_dir=self.output_dir,
+                nonequ_steps=nonequ_steps,
+                resume=resume,
+                checkpoint_interval=checkpoint_interval,
+            )
+        else:
+            logger.info('compute_viscosity is false; skipping nonequilibrium run')
 
     def post_process(self,):
         logger.info('post processing transport protocol')
-        vis = viscosity_calc(self.output_dir)
-        md_volume, md_temperature = volume_calc(self.output_dir)
-        logger.info('viscosity: %.3f', vis)
+        cfg = getattr(self, 'config', {}) if hasattr(self, 'config') else {}
+        compute_viscosity = True if not isinstance(cfg, dict) else bool(cfg.get('compute_viscosity', True))
+        compute_conductivity = True if not isinstance(cfg, dict) else bool(cfg.get('compute_conductivity', True))
 
-        nvt_positions = dcd_read(os.path.join(self.output_dir, 'nvt.dcd'))
-        species_mass_dict, species_number_dict, species_charges_dict = {}, {}, {}
-        solvent, cation, anion = [], [], []
-        for mol_name, topo_mol in self.components.items():
-            species_mass_dict[mol_name] = [atom.mass for atom in topo_mol.atoms]
-            species_number_dict[mol_name] = topo_mol.molar_num
-            species_charges_dict[mol_name] = int(sum([atom.charge for atom in topo_mol.atoms]))
-            if topo_mol.type == ComponentType.SOLVENT:
-                solvent.append(mol_name)
-            elif topo_mol.type == ComponentType.CATION:
-                cation.append(mol_name)
-            elif topo_mol.type == ComponentType.ANION:
-                anion.append(mol_name)
-        sorted_components_names = anion + cation + solvent
+        results = {}
+        vis = None
+        if compute_viscosity:
+            vis = viscosity_calc(self.output_dir)
+            logger.info('viscosity: %.3f cP', vis)
+            results['viscosity'] = vis
+        else:
+            # Optional user-provided viscosity for Yeh–Hummer
+            if isinstance(cfg, dict) and cfg.get('viscosity_cP') is not None:
+                vis = float(cfg['viscosity_cP'])
+                logger.info('Using provided viscosity for YH correction: %.3f cP', vis)
 
-        # keep solvent at the end
-        species_charges_dict = {k: species_charges_dict[k] for k in sorted_components_names}
-        species_mass_dict = {k: species_mass_dict[k] for k in sorted_components_names}
-        species_number_dict = {k: species_number_dict[k] for k in sorted_components_names}
+        if compute_conductivity:
+            # Locate NVT outputs robustly: allow overrides, then output_dir, then CWD
+            cfg = self.config if isinstance(self, TransportProtocol) and isinstance(self.config, dict) else self.config
+            dcd_path = None
+            if isinstance(cfg, dict) and cfg.get('nvt_dcd'):
+                dcd_path = cfg['nvt_dcd']
+            else:
+                dcd_candidate = os.path.join(self.output_dir, 'nvt.dcd')
+                dcd_path = dcd_candidate if os.path.isfile(dcd_candidate) else 'nvt.dcd'
+            nvt_positions = dcd_read(dcd_path)
+            md_volume, md_temperature = volume_calc(self.output_dir, csv_override=(cfg.get('nvt_state_csv') if isinstance(cfg, dict) else None))
+            species_mass_dict, species_number_dict, species_charges_dict = {}, {}, {}
+            solvent, cation, anion = [], [], []
+            for mol_name, topo_mol in self.components.items():
+                species_mass_dict[mol_name] = [atom.mass for atom in topo_mol.atoms]
+                species_number_dict[mol_name] = topo_mol.molar_num
+                species_charges_dict[mol_name] = int(sum([atom.charge for atom in topo_mol.atoms]))
+                if topo_mol.type == ComponentType.SOLVENT:
+                    solvent.append(mol_name)
+                elif topo_mol.type == ComponentType.CATION:
+                    cation.append(mol_name)
+                elif topo_mol.type == ComponentType.ANION:
+                    anion.append(mol_name)
+            sorted_components_names = anion + cation + solvent
 
-        results = onsager_calc(
-            species_mass_dict,
-            species_number_dict,
-            species_charges_dict,
-            md_volume,
-            vis,
-            md_temperature,
-            nvt_positions,
-        )
-        results['viscosity'] = vis
-        with open(os.path.join(self.output_dir, 'results.json'), 'w') as f:
-            json.dump(results, f, indent=2)
+            # keep solvent at the end
+            species_charges_dict = {k: species_charges_dict[k] for k in sorted_components_names}
+            species_mass_dict = {k: species_mass_dict[k] for k in sorted_components_names}
+            species_number_dict = {k: species_number_dict[k] for k in sorted_components_names}
 
+            cond = onsager_calc(
+                species_mass_dict,
+                species_number_dict,
+                species_charges_dict,
+                md_volume,
+                vis,  # may be None; onsager_calc handles YH skip when None
+                md_temperature,
+                nvt_positions,
+            )
+            results.update(cond)
+
+        if results:
+            with open(os.path.join(self.output_dir, 'results.json'), 'w') as f:
+                json.dump(results, f, indent=2)
+        
 
 class HVapProtocol(Protocol):
 
@@ -436,8 +629,19 @@ class HVapProtocol(Protocol):
 
     def run_protocol(self):
         logger.info('running hvap protocol')
-        npt_steps = 1500000
-        nvt_steps = 5000000
+        # Allow override by steps or time (2 fs timestep)
+        def steps_from_time(cfg, steps_key, default_steps, time_ns_key=None, time_ps_key=None, timestep_fs=2):
+            if isinstance(cfg, dict):
+                if time_ns_key and cfg.get(time_ns_key) is not None:
+                    return int(float(cfg[time_ns_key]) * 1e6 / float(timestep_fs))
+                if time_ps_key and cfg.get(time_ps_key) is not None:
+                    return int(float(cfg[time_ps_key]) * 1e3 / float(timestep_fs))
+                if cfg.get(steps_key) is not None:
+                    return int(cfg[steps_key])
+            return int(default_steps)
+
+        npt_steps = steps_from_time(self.config, 'npt_steps', 1500000, time_ns_key='npt_time_ns', time_ps_key='npt_time_ps')
+        nvt_steps = steps_from_time(self.config, 'nvt_steps', 5000000, time_ns_key='nvt_time_ns', time_ps_key='nvt_time_ps')
         nonbonded_params = self.generate_ff_params(self.config['smiles'])
         self.components = self.build_system(
             self.config['natoms'],
@@ -464,6 +668,8 @@ class HVapProtocol(Protocol):
             nonbonded_params,
             unit_cell,
         )
+        resume = bool(self.config.get('resume', False))
+        checkpoint_interval = int(self.config.get('checkpoint_interval', 5000))
         npt_run(
             top=liq_top,
             system=liq_system,
@@ -471,6 +677,8 @@ class HVapProtocol(Protocol):
             temperature=self.config['temperature'],
             npt_steps=npt_steps,
             work_dir=self.output_dir,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
         )
         logger.info('running gas phase')
         grofileparser = app.GromacsGroFile(gas_gro_file)
@@ -487,6 +695,8 @@ class HVapProtocol(Protocol):
                 temperature=self.config['temperature'],
                 nvt_steps=nvt_steps,
                 work_dir=self.output_dir,
+                resume=resume,
+                checkpoint_interval=checkpoint_interval,
                 timestep=0.2)
 
     def post_process(self,):

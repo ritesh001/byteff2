@@ -317,6 +317,10 @@ def fsc_self_diffusivity(T: float, viscosity: float, L: float) -> float:
     # MyNoteEq: 4.6
     # T [K]; viscosity [cP]; L [angstrom]
     # D [10^10 m^2/s]
+    # Be robust to missing/invalid viscosity: return 0 (no YH correction)
+    if viscosity is None or (isinstance(viscosity, (int, float)) and viscosity <= 0) or (
+            isinstance(viscosity, (int, float)) and not np.isfinite(viscosity)):
+        return torch.tensor(0.0, dtype=torch.float64)
     coeff = unit.kB * (T * unit.K) * unit.pbc_xi / (6 * torch.pi * (viscosity * unit.cP) * unit.angstrom)
     coeff /= (1.e-10 * unit.m**2 / unit.s)
     return coeff / L
@@ -365,7 +369,13 @@ def fsc_full_Lambda(dfsc: Union[float, torch.Tensor],
 unit = OnsagerUnit()
 
 
-def onsager_calc(species_mass, species_number, species_charge, volume_angstrom3, viscosity_cP, T_K, positions):
+def onsager_calc(species_mass,
+                 species_number,
+                 species_charge,
+                 volume_angstrom3,
+                 viscosity_cP,
+                 T_K,
+                 positions):
 
     dtype = torch.float64
     nsp = len(species_mass)
@@ -486,9 +496,16 @@ def onsager_calc(species_mass, species_number, species_charge, volume_angstrom3,
     outdata["conductivity_NE"] = sigma_ne__md.item()
     outdata["diffusivity_unit"] = "10^-10 m^2/s"
 
-    DYH1 = fsc_self_diffusivity(RoomT, Viscosity, BoxLen)
+    # Yeh–Hummer finite-size correction requires viscosity
+    if Viscosity is None or (isinstance(Viscosity, (int, float)) and Viscosity <= 0):
+        DYH1 = torch.tensor(0.0, dtype=dtype)
+        yh_applied = False
+    else:
+        DYH1 = fsc_self_diffusivity(RoomT, Viscosity, BoxLen)
+        yh_applied = True
     DselfInf = Dself_MD + DYH1
     outdata["Dself_inf"] = DselfInf.tolist()
+    outdata["yh_correction_applied"] = yh_applied
 
     logger.info(f"msd_self: {DselfInf.tolist()}")
     logger.info(f"conductivity: {sigma__o__md.item()}")

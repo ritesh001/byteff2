@@ -42,6 +42,8 @@ def openmm_run(
     box_vec: Optional[omm.Vec3] = None,
     steps: int = None,
     temperature: float = 300.,
+    resume: bool = False,
+    checkpoint_path: Optional[str] = None,
 ):
 
     with temporary_cd(work_dir):
@@ -52,14 +54,51 @@ def openmm_run(
             force.setForceGroup(force_group)
             # you should only see these in output:
             logger.info('system force %s, group %d', force.getName(), force.getForceGroup())
-
-        platform = omm.Platform.getPlatformByName('CUDA')
-        platform.setPropertyDefaultValue('Precision', 'mixed')
+        
+        # Select OpenMM platform with optional env override
+        # Env overrides (first match): BYTEFF2_OPENMM_PLATFORM, OPENMM_PLATFORM, OPENMM_DEFAULT_PLATFORM
+        # Precision override: BYTEFF2_OPENMM_PRECISION or OPENMM_PRECISION (CUDA/OpenCL only)
+        try:
+            from simtk.openmm import Platform  # noqa: WPS433
+        except Exception:
+            Platform = omm.Platform
+        requested = os.environ.get('BYTEFF2_OPENMM_PLATFORM') or os.environ.get('OPENMM_PLATFORM') or os.environ.get(
+            'OPENMM_DEFAULT_PLATFORM')
+        precision = os.environ.get('BYTEFF2_OPENMM_PRECISION') or os.environ.get('OPENMM_PRECISION') or 'mixed'
+        try:
+            if requested:
+                platform = Platform.getPlatformByName(requested)
+            else:
+                available = [Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())]
+                print("Available platforms:", available)
+                if "CUDA" in available:
+                    platform = Platform.getPlatformByName("CUDA")
+                elif "OpenCL" in available:
+                    platform = Platform.getPlatformByName("OpenCL")
+                elif "CPU" in available:
+                    platform = Platform.getPlatformByName("CPU")
+                else:
+                    platform = Platform.getPlatformByName("Reference")
+            # Set precision if supported
+            if platform.getName() in ("CUDA", "OpenCL"):
+                try:
+                    platform.setPropertyDefaultValue('Precision', precision)
+                except Exception:
+                    pass
+        except Exception:
+            # final fallback
+            platform = omm.Platform.getPlatformByName('CPU')
         temperature = temperature * ou.kelvin  # Temperature for initial velocity
         sim = app.Simulation(top.topology, system, integrator, platform)
         sim.context.setPositions(positions)
         if box_vec is not None:
             sim.context.setPeriodicBoxVectors(*box_vec)
+        # Resume from checkpoint if requested and available
+        if resume and checkpoint_path and os.path.isfile(checkpoint_path):
+            logger.info('Resuming %s from checkpoint %s', task_name, checkpoint_path)
+            sim.loadCheckpoint(checkpoint_path)
+            minimize = False  # do not minimize when resuming
+
         if minimize:
             # Minimize the energy
             logger.info('Minimizing energy')
@@ -67,8 +106,9 @@ def openmm_run(
                 maxIterations=1000,
                 tolerance=10 * ou.kilojoules_per_mole / ou.nanometer,
             )
-        # initialize temperature
-        sim.context.setVelocitiesToTemperature(temperature)
+        # initialize temperature only when not resuming from a checkpoint
+        if not (resume and checkpoint_path and os.path.isfile(checkpoint_path)):
+            sim.context.setVelocitiesToTemperature(temperature)
         if reporter is not None:
             if isinstance(reporter, list):
                 sim.reporters = reporter
@@ -93,6 +133,8 @@ def npt_run(
     npt_steps=2000000,
     temperature: float = 300,
     work_dir: str = '.',
+    resume: bool = False,
+    checkpoint_interval: int = 5000,
 ):
     top = copy.deepcopy(top)
     system = copy.deepcopy(system)
@@ -104,8 +146,9 @@ def npt_run(
     system.addForce(barostat)
     integrator = omm.MTSLangevinIntegrator(temperature * ou.kelvin, 0.1 / ou.picosecond, timestep * ou.femtoseconds,
                                            [(0, 2), (1, 1)])
+    append_logs = bool(resume and os.path.isfile(os.path.join(work_dir, 'npt.chk')))
     state_reporter = app.StateDataReporter(
-        file=os.path.join(work_dir, 'npt_state.csv'),
+        file='npt_state.csv',
         reportInterval=500,
         step=True,
         time=True,
@@ -122,24 +165,38 @@ def npt_run(
         separator=',',
         systemMass=None,
         totalSteps=None,
-        append=False,
+        append=append_logs,
     )
-    dcd_reporter = app.DCDReporter(
-        os.path.join(work_dir, 'npt.dcd'),
-        reportInterval=500,
-        enforcePeriodicBox=False,
-    )
+    dcd_path = 'npt.dcd'
+    try:
+        dcd_reporter = app.DCDReporter(
+            dcd_path,
+            reportInterval=500,
+            enforcePeriodicBox=False,
+            append=append_logs,
+        )
+    except TypeError:
+        dcd_reporter = app.DCDReporter(
+            dcd_path,
+            reportInterval=500,
+            enforcePeriodicBox=False,
+        )
+    reporters = [state_reporter, dcd_reporter]
+    if checkpoint_interval and checkpoint_interval > 0:
+        reporters.append(app.CheckpointReporter('npt.chk', checkpoint_interval))
     return openmm_run(
         task_name='npt',
         top=top,
         system=system,
         positions=positions,
         integrator=integrator,
-        reporter=[state_reporter, dcd_reporter],
+        reporter=reporters,
         work_dir=work_dir,
         minimize=True,
         steps=npt_steps,
         temperature=temperature,
+        resume=resume,
+        checkpoint_path='npt.chk',
     )
 
 
@@ -169,15 +226,18 @@ def nvt_run(
         temperature: float,
         work_dir: str,
         nvt_steps: int,
-        timestep: int = 2  # fs
+        timestep: int = 2,  # fs
+        resume: bool = False,
+        checkpoint_interval: int = 5000,
 ):
     top = copy.deepcopy(top)
     system = copy.deepcopy(system)
     integrator = omm.MTSLangevinIntegrator(temperature * ou.kelvin, 0.1 / ou.picosecond, timestep * ou.femtoseconds,
                                            [(0, 2), (1, 1)])
 
+    append_logs = bool(resume and os.path.isfile(os.path.join(work_dir, 'nvt.chk')))
     state_reporter = app.StateDataReporter(
-        file=os.path.join(work_dir, 'nvt_state.csv'),
+        file='nvt_state.csv',
         reportInterval=500,
         step=True,
         time=True,
@@ -194,31 +254,55 @@ def nvt_run(
         separator=',',
         systemMass=None,
         totalSteps=None,
-        append=False,
+        append=append_logs,
     )
-    dcd_reporter = app.DCDReporter(
-        os.path.join(work_dir, 'nvt.dcd'),
-        reportInterval=500,
-        enforcePeriodicBox=False,
-    )
+    dcd_path = 'nvt.dcd'
+    try:
+        dcd_reporter = app.DCDReporter(
+            dcd_path,
+            reportInterval=500,
+            enforcePeriodicBox=False,
+            append=append_logs,
+        )
+    except TypeError:
+        dcd_reporter = app.DCDReporter(
+            dcd_path,
+            reportInterval=500,
+            enforcePeriodicBox=False,
+        )
+    reporters = [state_reporter, dcd_reporter]
+    if checkpoint_interval and checkpoint_interval > 0:
+        reporters.append(app.CheckpointReporter('nvt.chk', checkpoint_interval))
     return openmm_run(
         task_name='nvt',
         top=top,
         system=system,
         positions=positions,
         integrator=integrator,
-        reporter=[state_reporter, dcd_reporter],
+        reporter=reporters,
         work_dir=work_dir,
         minimize=False,
         box_vec=box_vec,
         steps=nvt_steps,
         temperature=temperature,
+        resume=resume,
+        checkpoint_path='nvt.chk',
     )
 
 
-def volume_calc(work_dir):
+def volume_calc(work_dir, csv_override: str = None):
     with temporary_cd(work_dir):
-        csv_file = 'nvt_state.csv'
+        candidates = []
+        if csv_override:
+            candidates.append(csv_override)
+        candidates.extend(['nvt_state.csv', 'nvt_results.csv', 'nvt.csv'])
+        csv_file = None
+        for cand in candidates:
+            if cand and os.path.isfile(cand):
+                csv_file = cand
+                break
+        if not csv_file:
+            raise FileNotFoundError(f'Could not find any NVT state CSV among: {candidates} in {os.getcwd()}')
         result_df = pd.read_csv(csv_file)
         volume = result_df["Box Volume (nm^3)"].mean() * 1000
         temperature = result_df["Temperature (K)"].mean()
