@@ -1217,6 +1217,8 @@ class HVapProtocol(Protocol):
         return result
 
 
+### TODO: Kirkwood-Buff integral protocol
+
 class DielectricProtocol(Protocol):
 
     def __init__(self, config: dict):
@@ -1225,11 +1227,16 @@ class DielectricProtocol(Protocol):
         self.components = None
 
     def run_protocol(self):
+        import openmm as omm
         logger.info('running dielectric protocol')
-        # steps configurable via JSON; defaults provide adequate sampling
+        # steps / intervals configurable via config dict
         npt_steps = int(self.config.get('npt_steps', 2000000))
         nvt_steps = int(self.config.get('nvt_steps', 6000000))
         dipole_interval = int(self.config.get('dipole_interval', 500))
+        nvt_timestep_fs = int(self.config.get('nvt_timestep_fs', 2))
+        traj_interval = int(self.config.get('traj_interval', 500))
+        checkpoint_interval = int(self.config.get('checkpoint_interval', 5000))
+        resume = bool(self.config.get('resume', False))
         nonbonded_params = self.generate_ff_params(self.config['smiles'])
         self.components = self.build_system(
             self.config['natoms'],
@@ -1247,56 +1254,88 @@ class DielectricProtocol(Protocol):
             unit_cell,
         )
 
-        # Resume path: reuse an existing NVT trajectory (e.g. produced by
-        # TransportProtocol) and reconstruct dipole.csv by replaying frames
-        # through an OpenMM Context. Triggered explicitly via
-        # config['resume_from_nvt']=True, or auto-detected when nvt.dcd exists
-        # but dipole.csv is missing/empty.
-        nvt_dcd_cfg = self.config.get('nvt_dcd') if isinstance(self.config, dict) else None
-        nvt_dcd_path = nvt_dcd_cfg or os.path.join(self.output_dir, 'nvt.dcd')
-        dipole_csv = os.path.join(self.output_dir, 'dipole.csv')
-        explicit_resume = bool(self.config.get('resume_from_nvt', False)) if isinstance(self.config, dict) else False
-        if not os.path.isfile(dipole_csv):
-            dipole_missing_or_empty = True
-        else:
-            dipole_missing_or_empty = (os.path.getsize(dipole_csv) < 64
-                                       or len(pd.read_csv(dipole_csv)) == 0)
-        if (explicit_resume or dipole_missing_or_empty) and os.path.isfile(nvt_dcd_path):
-            logger.info('dielectric: resuming from existing NVT trajectory %s; '
-                        'skipping NPT/NVT and replaying frames to regenerate %s',
-                        nvt_dcd_path, dipole_csv)
-            self._replay_dipoles_from_trajectory(
-                input_system,
-                nvt_dcd_path,
-                dipole_csv,
-                dipole_interval=dipole_interval,
-            )
-            return
+        # ------------------------------------------------------------------ #
+        # Determine seed positions / box for the NVT+dipole run               #
+        # ------------------------------------------------------------------ #
+        start_from = self.config.get('start_from')
+        if start_from and os.path.isfile(start_from):
+            # Skip NPT entirely and seed NVT from an existing trajectory/GRO.
+            if start_from.lower().endswith('.gro'):
+                seed_parser = app.GromacsGroFile(start_from)
+                seed_positions = seed_parser.positions
+                seed_box_vec = seed_parser.getUnitCellDimensions()
+                logger.info('start_from=%s (GRO): skipping NPT', start_from)
+            else:
+                # Treat as DCD: load the last frame
+                frames = dcd_read(start_from)
+                if len(frames) == 0:
+                    raise ValueError(f'start_from DCD file contains no frames: {start_from}')
+                last_frame = frames[-1]
+                seed_positions = [omm.Vec3(x, y, z) * ou.angstroms for x, y, z in last_frame]
 
-        logger.info('npt run')
-        npt_positions, npt_box_vec = npt_run(
-            input_top,
-            input_system,
-            input_positions,
-            temperature=self.config['temperature'],
-            npt_steps=npt_steps,
-            work_dir=self.output_dir,
-        )
-        rescale_positions, rescale_box_vec = rescale_box(npt_positions, npt_box_vec, work_dir=self.output_dir)
+                # Resolve box dimensions from a state CSV next to the DCD or
+                # from an explicit override key.
+                dcd_dir = os.path.dirname(os.path.abspath(start_from))
+                state_csv = self.config.get('start_from_state_csv')
+                if not state_csv:
+                    for cand in ['nvt_state.csv', 'npt_state.csv']:
+                        p = os.path.join(dcd_dir, cand)
+                        if os.path.isfile(p):
+                            state_csv = p
+                            break
+                if state_csv and os.path.isfile(state_csv):
+                    df_csv = pd.read_csv(state_csv)
+                    L = float(df_csv['Box Volume (nm^3)'].iloc[-500:].mean()) ** (1.0 / 3.0)
+                    logger.info('Box length %.4f nm from state CSV %s', L, state_csv)
+                else:
+                    L = float(unit_cell[0].value_in_unit(ou.nanometers))
+                    logger.warning('No state CSV found alongside %s; using GRO unit cell (%.4f nm)', start_from, L)
+                seed_box_vec = [
+                    omm.Vec3(L, 0.0, 0.0) * ou.nanometers,
+                    omm.Vec3(0.0, L, 0.0) * ou.nanometers,
+                    omm.Vec3(0.0, 0.0, L) * ou.nanometers,
+                ]
+                logger.info('start_from=%s (DCD, last frame): skipping NPT', start_from)
+        else:
+            if start_from:
+                logger.warning('start_from=%s not found; falling back to NPT', start_from)
+            logger.info('npt run')
+            npt_positions, npt_box_vec = npt_run(
+                input_top,
+                input_system,
+                input_positions,
+                temperature=self.config['temperature'],
+                npt_steps=npt_steps,
+                work_dir=self.output_dir,
+                traj_interval=traj_interval,
+                checkpoint_interval=checkpoint_interval,
+            )
+            seed_positions, seed_box_vec = rescale_box(npt_positions, npt_box_vec, work_dir=self.output_dir)
+
+        # ------------------------------------------------------------------ #
+        # NVT run with dipole reporter                                         #
+        # ------------------------------------------------------------------ #
         logger.info('nvt run with dipole recording')
+        dipole_csv = os.path.join(self.output_dir, 'dipole.csv')
+        append_dipole = resume and os.path.isfile(dipole_csv)
         dipole_reporter = DipoleReporter(
             file_path=dipole_csv,
             reportInterval=dipole_interval,
             system=input_system,
+            append=append_dipole,
         )
         _nvt_positions, _nvt_box_vec = nvt_run(
             input_top,
             input_system,
-            rescale_positions,
-            rescale_box_vec,
+            seed_positions,
+            seed_box_vec,
             temperature=self.config['temperature'],
             work_dir=self.output_dir,
             nvt_steps=nvt_steps,
+            timestep=nvt_timestep_fs,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
+            traj_interval=traj_interval,
             extra_reporters=[dipole_reporter],
         )
 
