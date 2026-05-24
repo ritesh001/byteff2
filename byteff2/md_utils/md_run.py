@@ -727,6 +727,7 @@ def dcd_read(fp):
     return position
 
 
+
 class DipoleReporter:
     """
     Reporter for recording the total dipole moment of a system using the AMOEBA force field.
@@ -737,10 +738,10 @@ class DipoleReporter:
     - Dipole components and magnitude: e*Angstrom
     """
 
-    def __init__(self, file_path, reportInterval, system):
+    def __init__(self, file_path, reportInterval, system, append: bool = False):
         """
         Initialize the reporter.
-        
+
         Parameters
         ----------
         file_path : str
@@ -749,6 +750,8 @@ class DipoleReporter:
             The interval (in steps) at which to write to the file.
         system : openmm.System
             The OpenMM System object to extract force and charge information.
+        append : bool
+            If True, append to an existing file instead of overwriting it.
         """
         self._reportInterval = int(reportInterval)
         self._file_path = file_path
@@ -774,8 +777,10 @@ class DipoleReporter:
 
         # 3. Initialize the output file and write the header
         os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
-        self._out = open(file_path, 'w')
-        self._out.write('time_ps,Mx_eA,My_eA,Mz_eA,M_mag_eA\n')
+        mode = 'a' if append and os.path.isfile(file_path) else 'w'
+        self._out = open(file_path, mode)
+        if mode == 'w':
+            self._out.write('time_ps,Mx_eA,My_eA,Mz_eA,M_mag_eA\n')
         self._out.flush()
 
     def describeNextReport(self, simulation):
