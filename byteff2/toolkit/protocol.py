@@ -7,6 +7,7 @@ from typing import OrderedDict
 
 import ase.io as aio
 import numpy as np
+import openmm as omm
 import openmm.app as app
 import openmm.unit as ou
 import pandas as pd
@@ -1245,6 +1246,33 @@ class DielectricProtocol(Protocol):
             nonbonded_params,
             unit_cell,
         )
+
+        # Resume path: reuse an existing NVT trajectory (e.g. produced by
+        # TransportProtocol) and reconstruct dipole.csv by replaying frames
+        # through an OpenMM Context. Triggered explicitly via
+        # config['resume_from_nvt']=True, or auto-detected when nvt.dcd exists
+        # but dipole.csv is missing/empty.
+        nvt_dcd_cfg = self.config.get('nvt_dcd') if isinstance(self.config, dict) else None
+        nvt_dcd_path = nvt_dcd_cfg or os.path.join(self.output_dir, 'nvt.dcd')
+        dipole_csv = os.path.join(self.output_dir, 'dipole.csv')
+        explicit_resume = bool(self.config.get('resume_from_nvt', False)) if isinstance(self.config, dict) else False
+        if not os.path.isfile(dipole_csv):
+            dipole_missing_or_empty = True
+        else:
+            dipole_missing_or_empty = (os.path.getsize(dipole_csv) < 64
+                                       or len(pd.read_csv(dipole_csv)) == 0)
+        if (explicit_resume or dipole_missing_or_empty) and os.path.isfile(nvt_dcd_path):
+            logger.info('dielectric: resuming from existing NVT trajectory %s; '
+                        'skipping NPT/NVT and replaying frames to regenerate %s',
+                        nvt_dcd_path, dipole_csv)
+            self._replay_dipoles_from_trajectory(
+                input_system,
+                nvt_dcd_path,
+                dipole_csv,
+                dipole_interval=dipole_interval,
+            )
+            return
+
         logger.info('npt run')
         npt_positions, npt_box_vec = npt_run(
             input_top,
@@ -1257,7 +1285,7 @@ class DielectricProtocol(Protocol):
         rescale_positions, rescale_box_vec = rescale_box(npt_positions, npt_box_vec, work_dir=self.output_dir)
         logger.info('nvt run with dipole recording')
         dipole_reporter = DipoleReporter(
-            file_path=os.path.join(self.output_dir, 'dipole.csv'),
+            file_path=dipole_csv,
             reportInterval=dipole_interval,
             system=input_system,
         )
@@ -1271,6 +1299,81 @@ class DielectricProtocol(Protocol):
             nvt_steps=nvt_steps,
             extra_reporters=[dipole_reporter],
         )
+
+    def _replay_dipoles_from_trajectory(
+        self,
+        system: 'omm.System',
+        dcd_path: str,
+        dipole_csv: str,
+        dipole_interval: int,
+    ):
+        """Reconstruct dipole.csv from an existing NVT trajectory.
+
+        Induced dipoles require a live OpenMM Context, so we replay each
+        frame through a Context built from `system`, then write the same
+        CSV format produced by DipoleReporter.
+        """
+        amoeba_force = None
+        for i in range(system.getNumForces()):
+            f = system.getForce(i)
+            if isinstance(f, omm.AmoebaMultipoleForce):
+                amoeba_force = f
+                break
+        if amoeba_force is None:
+            raise RuntimeError('AmoebaMultipoleForce not found in system; '
+                               'cannot replay dipoles.')
+
+        n_particles = system.getNumParticles()
+        charges = np.zeros(n_particles)
+        for i in range(n_particles):
+            params = amoeba_force.getMultipoleParameters(i)
+            charges[i] = params[0].value_in_unit(ou.elementary_charge)
+
+        # DCD positions are stored in Angstrom (DCD spec). dcd_read returns
+        # raw values from MDAnalysis libdcd, so they are already in A.
+        frames_A = dcd_read(dcd_path)
+        if len(frames_A) == 0:
+            raise RuntimeError(f'No frames found in {dcd_path}')
+
+        # Pick a CPU platform for the replay; correctness matters, speed does not
+        try:
+            platform = omm.Platform.getPlatformByName('Reference')
+        except Exception:
+            platform = None
+        integrator = omm.VerletIntegrator(1.0 * ou.femtoseconds)
+        context = (omm.Context(system, integrator, platform)
+                   if platform is not None else omm.Context(system, integrator))
+
+        # Time-per-frame in the existing trajectory. DCDReporter uses traj_interval
+        # steps; fall back to dipole_interval if no explicit override.
+        timestep_fs = float(self.config.get('nvt_timestep_fs', 2)) if isinstance(self.config, dict) else 2.0
+        traj_interval = int(self.config.get('traj_interval', dipole_interval)) if isinstance(self.config, dict) else dipole_interval
+        dt_ps_per_frame = timestep_fs * traj_interval * 1e-3
+
+        os.makedirs(os.path.dirname(os.path.abspath(dipole_csv)), exist_ok=True)
+        with open(dipole_csv, 'w') as out:
+            out.write('time_ps,Mx_eA,My_eA,Mz_eA,M_mag_eA\n')
+            for k, pos_A in enumerate(frames_A):
+                # Set context positions in nm
+                context.setPositions((pos_A / 10.0).tolist())
+                m_monopole = np.sum(charges[:, np.newaxis] * pos_A, axis=0)
+                try:
+                    mu_ind_list = amoeba_force.getInducedDipoles(context)
+                except omm.OpenMMException:
+                    # In case the force handle becomes stale
+                    for i in range(system.getNumForces()):
+                        f = system.getForce(i)
+                        if isinstance(f, omm.AmoebaMultipoleForce):
+                            amoeba_force = f
+                            break
+                    mu_ind_list = amoeba_force.getInducedDipoles(context)
+                # Induced dipoles are in e*nm; convert to e*A
+                m_induced = np.array(mu_ind_list).sum(axis=0) * 10.0
+                m_total = m_monopole + m_induced
+                m_mag = float(np.linalg.norm(m_total))
+                t_ps = k * dt_ps_per_frame
+                out.write(f"{t_ps:.4f},{m_total[0]:.6f},{m_total[1]:.6f},{m_total[2]:.6f},{m_mag:.6f}\n")
+        logger.info('dielectric: wrote %d dipole records to %s', len(frames_A), dipole_csv)
 
     def post_process(self,):
 
@@ -1346,7 +1449,19 @@ class DielectricProtocol(Protocol):
         logger.info('post processing dielectric protocol')
         # Read dipole series and thermodynamic quantities
         dip_csv = os.path.join(self.output_dir, 'dipole.csv')
+        if not os.path.isfile(dip_csv):
+            raise RuntimeError(
+                f'{dip_csv} not found. If resuming from an existing NVT run, '
+                'set config["resume_from_nvt"]=True (or place nvt.dcd in '
+                'output_dir) so run_protocol replays the trajectory to '
+                'regenerate the dipole series.')
         df = pd.read_csv(dip_csv)
+        if len(df) < 10:
+            raise RuntimeError(
+                f'{dip_csv} has only {len(df)} rows. DipoleReporter likely '
+                'never ran. If resuming from an existing NVT, set '
+                'config["resume_from_nvt"]=True and re-run run_protocol to '
+                'replay the trajectory before post_process.')
         md_volume_A3, _ = volume_calc(self.output_dir)
 
         # use later part of trajectory to avoid initial relaxation bias
