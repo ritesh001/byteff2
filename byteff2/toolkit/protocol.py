@@ -1488,19 +1488,56 @@ class DielectricProtocol(Protocol):
         logger.info('post processing dielectric protocol')
         # Read dipole series and thermodynamic quantities
         dip_csv = os.path.join(self.output_dir, 'dipole.csv')
-        if not os.path.isfile(dip_csv):
-            raise RuntimeError(
-                f'{dip_csv} not found. If resuming from an existing NVT run, '
-                'set config["resume_from_nvt"]=True (or place nvt.dcd in '
-                'output_dir) so run_protocol replays the trajectory to '
-                'regenerate the dipole series.')
+        nvt_dcd_cfg = self.config.get('nvt_dcd') if isinstance(self.config, dict) else None
+        nvt_dcd_path = nvt_dcd_cfg or os.path.join(self.output_dir, 'nvt.dcd')
+
+        def _needs_replay() -> bool:
+            if not os.path.isfile(dip_csv):
+                return True
+            if os.path.getsize(dip_csv) < 64:
+                return True
+            try:
+                return len(pd.read_csv(dip_csv)) < 10
+            except Exception:
+                return True
+
+        if _needs_replay():
+            if not os.path.isfile(nvt_dcd_path):
+                raise RuntimeError(
+                    f'{dip_csv} is missing or empty and no NVT trajectory '
+                    f'found at {nvt_dcd_path} to replay from. Re-run the '
+                    'dielectric protocol from scratch, or point '
+                    'config["nvt_dcd"] at an existing trajectory.')
+            logger.info('dielectric: %s is missing/empty; reconstructing '
+                        'dipole series from %s', dip_csv, nvt_dcd_path)
+            # Rebuild the OpenMM System (needed for charges + induced dipoles).
+            nonbonded_params = self.generate_ff_params(self.config['smiles'])
+            if self.components is None:
+                self.components = self.build_system(
+                    self.config['natoms'],
+                    self.config['components'],
+                    self.config['working_dir'],
+                )
+            gro_file = f"{self.params_dir}/solvent_salt.gro"
+            top_file = f"{self.params_dir}/system.top"
+            grofileparser = app.GromacsGroFile(gro_file)
+            unit_cell = grofileparser.getUnitCellDimensions()
+            _input_top, input_system = generate_openmm_system(
+                top_file, nonbonded_params, unit_cell,
+            )
+            dipole_interval = int(self.config.get('dipole_interval', 500))
+            self._replay_dipoles_from_trajectory(
+                input_system,
+                nvt_dcd_path,
+                dip_csv,
+                dipole_interval=dipole_interval,
+            )
+
         df = pd.read_csv(dip_csv)
         if len(df) < 10:
             raise RuntimeError(
-                f'{dip_csv} has only {len(df)} rows. DipoleReporter likely '
-                'never ran. If resuming from an existing NVT, set '
-                'config["resume_from_nvt"]=True and re-run run_protocol to '
-                'replay the trajectory before post_process.')
+                f'{dip_csv} has only {len(df)} rows after replay attempt; '
+                'cannot compute dielectric.')
         md_volume_A3, _ = volume_calc(self.output_dir)
 
         # use later part of trajectory to avoid initial relaxation bias
@@ -1520,8 +1557,18 @@ class DielectricProtocol(Protocol):
 
         dielectric = 1.0 + fluct / (3.0 * eps0_star * V * R_gas * T)
 
-        # Calculate dipole autocorrelation function and correlation time
-        dt = 2.0 * self.config.get('dipole_interval', 500) * 1e-3  # ps (timestep in fs, every N steps)
+        # Calculate dipole autocorrelation function and correlation time.
+        # Derive dt from the time_ps column when available so a replayed
+        # dipole.csv (whose frame cadence is set by traj_interval, not
+        # dipole_interval) is handled correctly.
+        if 'time_ps' in df.columns and len(df) >= 2:
+            time_ps = df['time_ps'].values[start_index:]
+            if len(time_ps) >= 2:
+                dt = float(time_ps[1] - time_ps[0])
+            else:
+                dt = 2.0 * self.config.get('dipole_interval', 500) * 1e-3
+        else:
+            dt = 2.0 * self.config.get('dipole_interval', 500) * 1e-3
         dacf = calculate_dipole_autocorrelation(Mx, My, Mz)
         correlation_time = calculate_correlation_time(dacf, dt)
 
